@@ -14,7 +14,7 @@ from io import BytesIO
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 app = FastAPI()
 
@@ -78,7 +78,13 @@ def pixelate(img_bytes: bytes, size: int, colors: int) -> dict:
     side = min(w, h)
     img = img.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
 
+    # grade it a little before quantizing: pop the colors, lift contrast, sharpen edges.
+    # limited palettes come out flat and muddy without this.
+    img = ImageEnhance.Color(img).enhance(1.25)
+    img = ImageEnhance.Contrast(img).enhance(1.08)
     img = img.resize((size, size), Image.LANCZOS)
+    img = ImageEnhance.Sharpness(img).enhance(1.3)
+
     img = img.quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
 
     raw_palette = img.getpalette()
@@ -111,8 +117,8 @@ async def health():
 @app.get("/pixelate")
 async def pixelate_route(
     q: str = Query(..., max_length=80),
-    size: int = Query(32, ge=8, le=128),
-    colors: int = Query(24, ge=2, le=40),
+    size: int = Query(32, ge=8, le=192),
+    colors: int = Query(24, ge=2, le=48),
     catalog: str = Query("animals"),
 ):
     if catalog == "games":
