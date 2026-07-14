@@ -73,16 +73,17 @@ async def find_game_image(q: str) -> str | None:
 def pixelate(img_bytes: bytes, size: int, colors: int) -> dict:
     img = Image.open(BytesIO(img_bytes)).convert("RGB")
 
-    # center-crop to a square so the canvas isn't stretched
-    w, h = img.size
-    side = min(w, h)
-    img = img.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
-
     # grade it a little before quantizing: pop the colors, lift contrast, sharpen edges.
     # limited palettes come out flat and muddy without this.
     img = ImageEnhance.Color(img).enhance(1.25)
     img = ImageEnhance.Contrast(img).enhance(1.08)
-    img = img.resize((size, size), Image.LANCZOS)
+
+    # fit the WHOLE image inside the square canvas (no cropping) and pad the rest with
+    # grid value 0 = blank, unpaintable border. keeps the aspect ratio true.
+    w, h = img.size
+    scale = size / max(w, h)
+    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    img = img.resize((nw, nh), Image.LANCZOS)
     img = ImageEnhance.Sharpness(img).enhance(1.3)
 
     img = img.quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
@@ -102,10 +103,13 @@ def pixelate(img_bytes: bytes, size: int, colors: int) -> dict:
         [raw_palette[i * 3], raw_palette[i * 3 + 1], raw_palette[i * 3 + 2]]
         for i in order
     ]
-    grid = [
-        [remap[pixels[y * size + x]] for x in range(size)]
-        for y in range(size)
-    ]
+    ox, oy = (size - nw) // 2, (size - nh) // 2
+    grid = [[0] * size for _ in range(size)]
+    for y in range(nh):
+        row = grid[oy + y]
+        base = y * nw
+        for x in range(nw):
+            row[ox + x] = remap[pixels[base + x]]
     return {"width": size, "height": size, "palette": palette, "grid": grid}
 
 
