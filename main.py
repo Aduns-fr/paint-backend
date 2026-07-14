@@ -111,7 +111,7 @@ async def health():
 @app.get("/pixelate")
 async def pixelate_route(
     q: str = Query(..., max_length=80),
-    size: int = Query(32, ge=8, le=64),
+    size: int = Query(32, ge=8, le=128),
     colors: int = Query(24, ge=2, le=40),
     catalog: str = Query("animals"),
 ):
