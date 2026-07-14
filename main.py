@@ -148,6 +148,59 @@ async def gather_candidates(q: str, catalog: str, n: int) -> list[dict]:
                 except Exception:
                     pass
         else:
+            title = q
+            taxon_id = None
+            # resolve the taxon so we get its proper common name + can pull its photos
+            try:
+                r = await client.get(
+                    "https://api.inaturalist.org/v1/taxa",
+                    params={"q": q, "per_page": 1},
+                )
+                res = r.json().get("results", [])
+                if res:
+                    taxon_id = res[0].get("id")
+                    title = res[0].get("preferred_common_name") or res[0].get("name") or q
+                    photo = res[0].get("default_photo") or {}
+                    add(title, photo.get("medium_url"))
+            except Exception:
+                pass
+            # the deep well: top-voted research-grade observation photos (dozens per species)
+            try:
+                params = {
+                    "photos": "true", "per_page": min(max(n, 12), 50),
+                    "order_by": "votes", "order": "desc", "quality_grade": "research",
+                }
+                if taxon_id:
+                    params["taxon_id"] = taxon_id
+                else:
+                    params["taxon_name"] = q
+                r = await client.get("https://api.inaturalist.org/v1/observations", params=params)
+                for obs in r.json().get("results", []):
+                    for p in obs.get("photos", []):
+                        u = p.get("url")
+                        if u:
+                            add(title, u.replace("/square.", "/medium."))
+            except Exception:
+                pass
+            # wikimedia commons image search (broadens variety, breeds, angles)
+            try:
+                r = await client.get(
+                    "https://commons.wikimedia.org/w/api.php",
+                    params={
+                        "action": "query", "generator": "search",
+                        "gsrsearch": q, "gsrnamespace": 6, "gsrlimit": 24,
+                        "prop": "imageinfo", "iiprop": "url", "iiurlwidth": 600, "format": "json",
+                    },
+                )
+                pages = r.json().get("query", {}).get("pages", {})
+                for page in pages.values():
+                    ii = (page.get("imageinfo") or [{}])[0]
+                    url = ii.get("thumburl") or ""
+                    if url.lower().endswith((".jpg", ".jpeg", ".png")):
+                        add(title, url)
+            except Exception:
+                pass
+            # wikipedia summary as a reliable fallback for the first tile
             try:
                 r = await client.get(
                     f"https://en.wikipedia.org/api/rest_v1/page/summary/{q}",
@@ -156,33 +209,6 @@ async def gather_candidates(q: str, catalog: str, n: int) -> list[dict]:
                 if r.status_code == 200:
                     j = r.json()
                     add(j.get("title", q), j.get("thumbnail", {}).get("source"))
-            except Exception:
-                pass
-            try:
-                r = await client.get(
-                    "https://api.inaturalist.org/v1/taxa",
-                    params={"q": q, "per_page": n + 2},
-                )
-                for taxon in r.json().get("results", []):
-                    photo = taxon.get("default_photo") or {}
-                    name = taxon.get("preferred_common_name") or taxon.get("name") or q
-                    add(name, photo.get("medium_url"))
-            except Exception:
-                pass
-            # wikipedia prefix search: several related pages with images (covers breeds etc)
-            try:
-                r = await client.get(
-                    "https://en.wikipedia.org/w/api.php",
-                    params={
-                        "action": "query", "generator": "prefixsearch", "gpssearch": q,
-                        "gpslimit": n + 2, "prop": "pageimages", "piprop": "thumbnail",
-                        "pithumbsize": 600, "format": "json",
-                    },
-                )
-                pages = r.json().get("query", {}).get("pages", {})
-                for page in sorted(pages.values(), key=lambda p: p.get("index", 99)):
-                    thumb = page.get("thumbnail", {}).get("source")
-                    add(page.get("title", q), thumb)
             except Exception:
                 pass
     return out[:n]
