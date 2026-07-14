@@ -192,12 +192,14 @@ async def gather_candidates(q: str, catalog: str, n: int) -> list[dict]:
 async def search_route(
     q: str = Query(..., max_length=80),
     catalog: str = Query("animals"),
-    n: int = Query(6, ge=1, le=8),
+    n: int = Query(6, ge=1, le=12),
+    offset: int = Query(0, ge=0, le=60),
     size: int = Query(40, ge=16, le=64),
     colors: int = Query(12, ge=4, le=24),
 ):
-    """returns candidate images WITH small pixelated previews, all in one call"""
-    candidates = await gather_candidates(q, catalog, n)
+    """returns candidate images WITH small pixelated previews, all in one call.
+    offset pages through candidates so the game can infinite-scroll results."""
+    candidates = (await gather_candidates(q, catalog, offset + n))[offset:]
     results = []
     async with httpx.AsyncClient(timeout=12, headers=UA, follow_redirects=True) as client:
         for c in candidates:
