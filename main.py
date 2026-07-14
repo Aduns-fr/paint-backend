@@ -78,12 +78,11 @@ def pixelate(img_bytes: bytes, size: int, colors: int) -> dict:
     img = ImageEnhance.Color(img).enhance(1.25)
     img = ImageEnhance.Contrast(img).enhance(1.08)
 
-    # fit the WHOLE image inside the square canvas (no cropping) and pad the rest with
-    # grid value 0 = blank, unpaintable border. keeps the aspect ratio true.
+    # center-crop to a square so the picture FILLS the whole canvas face (paint boards are square)
     w, h = img.size
-    scale = size / max(w, h)
-    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
-    img = img.resize((nw, nh), Image.LANCZOS)
+    side = min(w, h)
+    img = img.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
+    img = img.resize((size, size), Image.LANCZOS)
     img = ImageEnhance.Sharpness(img).enhance(1.3)
 
     img = img.quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
@@ -103,14 +102,116 @@ def pixelate(img_bytes: bytes, size: int, colors: int) -> dict:
         [raw_palette[i * 3], raw_palette[i * 3 + 1], raw_palette[i * 3 + 2]]
         for i in order
     ]
-    ox, oy = (size - nw) // 2, (size - nh) // 2
-    grid = [[0] * size for _ in range(size)]
-    for y in range(nh):
-        row = grid[oy + y]
-        base = y * nw
-        for x in range(nw):
-            row[ox + x] = remap[pixels[base + x]]
+    grid = [
+        [remap[pixels[y * size + x]] for x in range(size)]
+        for y in range(size)
+    ]
     return {"width": size, "height": size, "palette": palette, "grid": grid}
+
+
+# only fetch images from hosts our own catalogs use
+ALLOWED_IMAGE_HOSTS = (
+    "upload.wikimedia.org",
+    "static.inaturalist.org",
+    "inaturalist-open-data.s3.amazonaws.com",
+    "live.staticflickr.com",
+    "media.rawg.io",
+)
+
+
+def host_allowed(url: str) -> bool:
+    try:
+        return httpx.URL(url).host in ALLOWED_IMAGE_HOSTS
+    except Exception:
+        return False
+
+
+async def gather_candidates(q: str, catalog: str, n: int) -> list[dict]:
+    """collect up to n {title, url} image candidates for a query"""
+    out, seen = [], set()
+
+    def add(title, url):
+        if url and url not in seen and host_allowed(url):
+            seen.add(url)
+            out.append({"title": title, "url": url})
+
+    async with httpx.AsyncClient(timeout=10, headers=UA, follow_redirects=True) as client:
+        if catalog == "games":
+            if RAWG_KEY:
+                try:
+                    r = await client.get(
+                        "https://api.rawg.io/api/games",
+                        params={"key": RAWG_KEY, "search": q, "page_size": n},
+                    )
+                    for g in r.json().get("results", []):
+                        add(g.get("name", q), g.get("background_image"))
+                except Exception:
+                    pass
+        else:
+            try:
+                r = await client.get(
+                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{q}",
+                    params={"redirect": "true"},
+                )
+                if r.status_code == 200:
+                    j = r.json()
+                    add(j.get("title", q), j.get("thumbnail", {}).get("source"))
+            except Exception:
+                pass
+            try:
+                r = await client.get(
+                    "https://api.inaturalist.org/v1/taxa",
+                    params={"q": q, "per_page": n + 2},
+                )
+                for taxon in r.json().get("results", []):
+                    photo = taxon.get("default_photo") or {}
+                    name = taxon.get("preferred_common_name") or taxon.get("name") or q
+                    add(name, photo.get("medium_url"))
+            except Exception:
+                pass
+            # wikipedia prefix search: several related pages with images (covers breeds etc)
+            try:
+                r = await client.get(
+                    "https://en.wikipedia.org/w/api.php",
+                    params={
+                        "action": "query", "generator": "prefixsearch", "gpssearch": q,
+                        "gpslimit": n + 2, "prop": "pageimages", "piprop": "thumbnail",
+                        "pithumbsize": 600, "format": "json",
+                    },
+                )
+                pages = r.json().get("query", {}).get("pages", {})
+                for page in sorted(pages.values(), key=lambda p: p.get("index", 99)):
+                    thumb = page.get("thumbnail", {}).get("source")
+                    add(page.get("title", q), thumb)
+            except Exception:
+                pass
+    return out[:n]
+
+
+@app.get("/search")
+async def search_route(
+    q: str = Query(..., max_length=80),
+    catalog: str = Query("animals"),
+    n: int = Query(6, ge=1, le=8),
+    size: int = Query(40, ge=16, le=64),
+    colors: int = Query(12, ge=4, le=24),
+):
+    """returns candidate images WITH small pixelated previews, all in one call"""
+    candidates = await gather_candidates(q, catalog, n)
+    results = []
+    async with httpx.AsyncClient(timeout=12, headers=UA, follow_redirects=True) as client:
+        for c in candidates:
+            try:
+                r = await client.get(c["url"])
+                if r.status_code != 200:
+                    continue
+                d = pixelate(r.content, size, colors)
+                d["title"] = c["title"]
+                d["url"] = c["url"]
+                results.append(d)
+            except Exception:
+                continue
+    return results
 
 
 @app.get("/health")
@@ -120,15 +221,21 @@ async def health():
 
 @app.get("/pixelate")
 async def pixelate_route(
-    q: str = Query(..., max_length=80),
+    q: str = Query("", max_length=80),
+    url: str = Query("", max_length=500),
     size: int = Query(32, ge=8, le=192),
     colors: int = Query(24, ge=2, le=48),
     catalog: str = Query("animals"),
 ):
-    if catalog == "games":
-        url = await find_game_image(q)
-    else:
-        url = await find_animal_image(q)
+    # url comes from a prior /search selection; q is the direct-search fallback
+    if url:
+        if not host_allowed(url):
+            raise HTTPException(400, "image host not allowed")
+    elif q:
+        if catalog == "games":
+            url = await find_game_image(q)
+        else:
+            url = await find_animal_image(q)
     if not url:
         raise HTTPException(404, "no image found for that search")
 
