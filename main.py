@@ -101,14 +101,14 @@ def is_people(catalog: str) -> bool:
     return (catalog or "").lower() in PEOPLE_CATALOGS
 
 
-# for people we only want a clean PHOTO of the face — not a signature, wax figure, statue,
-# magazine cover, jersey, award, cartoon or anything with text. these wreck a portrait.
+# for people we only want a clean PHOTO of the person — not a signature, wax figure, statue,
+# logo, poster or anything with text/graphics. these wreck a portrait. (kept tight so we don't
+# reject legit event photos like "...at the 2019 awards.jpg".)
 _PEOPLE_JUNK = (
     "logo", "signature", "autograph", "wax", "tussaud", "statue", "mural", "graffiti",
-    "caricature", "cartoon", "poster", "magazine", "cover", "book", "award", "trophy",
-    "jersey", "boot", "stamp", "banner", "plaque", "tattoo", "meme", "quote", "diagram",
-    "map", "chart", "logo", "svg", "icon", "text", "collage", "montage", "timeline",
-    "career", "goals", "stats", "kit", "badge", "crest", "flag", "medal",
+    "caricature", "cartoon", "poster", "magazine", "trophy", "stamp", "banner",
+    "plaque", "tattoo", "meme", "diagram", "map", "chart", "svg", "icon",
+    "collage", "montage", "timeline", "badge", "crest", "flag", "medal", "coin",
 )
 
 
@@ -119,22 +119,65 @@ def person_photo_ok(url: str) -> bool:
     return not any(bad in low for bad in _PEOPLE_JUNK)
 
 
+# a wikipedia short-description almost always states the occupation for a real person
+# ("Argentine footballer", "American singer-songwriter"). we use that to CONFIRM a search hit
+# is actually a person, so a query like "apple" resolves to nothing instead of a logo.
+_PERSON_WORDS = (
+    "footballer", "soccer", "player", "athlete", "sprinter", "singer", "rapper",
+    "musician", "songwriter", "guitarist", "drummer", "actor", "actress", "model",
+    "presenter", "personality", "youtuber", "streamer", "influencer", "comedian",
+    "dancer", "boxer", "wrestler", "swimmer", "cyclist", "golfer", "racing driver",
+    "tennis", "basketball", "baseball", "cricketer", "rugby", "entertainer", "producer",
+    "author", "writer", "director", "gymnast", "skater", "quarterback", "coach",
+    "manager", "politician", "born ", "singer and", "actor and", "rapper and",
+)
+
+
+def looks_like_person(description: str) -> bool:
+    d = (description or "").lower()
+    if not d:
+        return False
+    if "disambiguation" in d or "may refer to" in d:
+        return False
+    return any(k in d for k in _PERSON_WORDS)
+
+
+async def resolve_person(client, q: str):
+    """turn a typed name into the RIGHT wikipedia person + their infobox portrait.
+    full-text search means 'messi', 'ronaldo', lowercase and small typos all land on the real
+    person (the summary/{title} endpoint we used before only worked for exact page titles).
+    returns (title, image_url) or (None, None) when nothing looks like a person."""
+    try:
+        r = await client.get("https://en.wikipedia.org/w/api.php", params={
+            "action": "query", "generator": "search", "gsrsearch": q, "gsrlimit": 6,
+            "prop": "pageimages|description", "piprop": "original|thumbnail",
+            "pithumbsize": 800, "pilimit": 6, "format": "json", "redirects": 1,
+        })
+        pages = list(r.json().get("query", {}).get("pages", {}).values())
+    except Exception:
+        return None, None
+    pages.sort(key=lambda p: p.get("index", 999))  # search relevance order
+    fallback = None  # top image-bearing page with an EMPTY description (obscure but real person)
+    for p in pages:
+        title = p.get("title", "")
+        if title.lower().startswith(("list of", "category:")):
+            continue
+        img = (p.get("original") or {}).get("source") or (p.get("thumbnail") or {}).get("source")
+        if not img:
+            continue
+        desc = p.get("description", "")
+        if looks_like_person(desc):
+            return title, img
+        if fallback is None and not desc:
+            fallback = (title, img)
+    return fallback if fallback else (None, None)
+
+
 async def find_person_image(q: str) -> str | None:
-    """best single portrait for a famous name: wikipedia's lead image (freely licensed)."""
+    """best single portrait for a famous name (freely licensed wikipedia lead image)."""
     async with httpx.AsyncClient(timeout=10, headers=UA, follow_redirects=True) as client:
-        try:
-            r = await client.get(
-                f"https://en.wikipedia.org/api/rest_v1/page/summary/{q}",
-                params={"redirect": "true"},
-            )
-            if r.status_code == 200:
-                j = r.json()
-                # prefer the full-res original, fall back to the thumbnail
-                return (j.get("originalimage", {}).get("source")
-                        or j.get("thumbnail", {}).get("source"))
-        except Exception:
-            pass
-    return None
+        _, img = await resolve_person(client, q)
+        return img
 
 
 def pixelate(img_bytes: bytes, size: int, colors: int, focus: str = "center") -> dict:
@@ -251,54 +294,25 @@ async def gather_candidates(q: str, catalog: str, n: int) -> list[dict]:
                 except Exception:
                     pass
         elif is_people(catalog):
-            # PEOPLE pipeline (celebrities + footballers): freely-licensed portraits only.
-            title = q
-            # wikipedia lead portrait first — clean, iconic, always the best single shot
-            try:
-                r = await client.get(
-                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{q}",
-                    params={"redirect": "true"},
-                )
-                if r.status_code == 200:
-                    j = r.json()
-                    title = j.get("title", q)
-                    add(title, j.get("originalimage", {}).get("source"))
-                    add(title, j.get("thumbnail", {}).get("source"))
-            except Exception:
-                pass
-            # every free image embedded in their wikipedia article — lots of real event photos.
-            # this is the variety well for people (equivalent to the observations well for animals).
-            try:
-                r = await client.get(
-                    f"https://en.wikipedia.org/api/rest_v1/page/media-list/{q}",
-                    params={"redirect": "true"},
-                )
-                if r.status_code == 200:
-                    for item in r.json().get("items", []):
-                        if item.get("type") != "image":
-                            continue
-                        srcset = item.get("srcset") or []
-                        src = srcset[0].get("src") if srcset else None
-                        if not src:
-                            continue
-                        if src.startswith("//"):
-                            src = "https:" + src
-                        if person_photo_ok(src):
-                            add(title, src)
-            except Exception:
-                pass
-            # wikimedia commons search for extra angles, filtered hard against non-photo junk
+            # PEOPLE pipeline (celebrities + footballers): freely-licensed photos of the RIGHT
+            # person only. step 1: resolve the typed name to the real wikipedia person + portrait.
+            title, lead = await resolve_person(client, q)
+            if not lead:
+                return []  # nothing matched a real person — return nothing, never random pics
+            add(title, lead)
+            # step 2: variety comes ONLY from that person's own commons category, so every extra
+            # shot is genuinely them (free-text image search was what pulled in random junk before).
             try:
                 r = await client.get(
                     "https://commons.wikimedia.org/w/api.php",
                     params={
-                        "action": "query", "generator": "search",
-                        "gsrsearch": q, "gsrnamespace": 6, "gsrlimit": 30,
+                        "action": "query", "generator": "categorymembers",
+                        "gcmtitle": f"Category:{title}", "gcmtype": "file", "gcmlimit": 40,
                         "prop": "imageinfo", "iiprop": "url", "iiurlwidth": 600, "format": "json",
                     },
                 )
                 pages = r.json().get("query", {}).get("pages", {})
-                for page in pages.values():
+                for page in sorted(pages.values(), key=lambda p: p.get("title", "")):
                     ii = (page.get("imageinfo") or [{}])[0]
                     url = ii.get("thumburl") or ""
                     if person_photo_ok(url):
@@ -418,7 +432,7 @@ async def search_route(
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "build": "r9-leanmem"}
+    return {"ok": True, "build": "r10-peoplesearch"}
 
 
 @app.get("/pixelate")
