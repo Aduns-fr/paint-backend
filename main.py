@@ -195,15 +195,21 @@ async def resolve_person(client, q: str):
         return None, None
     pages.sort(key=lambda p: p.get("index", 999))  # search relevance order
     fallback = None  # top image-bearing page with an EMPTY description (obscure but real person)
+    first_real = True
     for p in pages:
         title = p.get("title", "")
         if title.lower().startswith(("list of", "category:")):
             continue
-        img = (p.get("original") or {}).get("source") or (p.get("thumbnail") or {}).get("source")
-        if not img:
-            continue
         desc = p.get("description", "")
         if blocked_text(title) or blocked_text(desc):
+            # if the TOP match for this query is a blocked person, the player was searching for
+            # THEM — return nothing rather than sliding to a relative or a spin-off page.
+            if first_real:
+                return None, None
+            continue
+        first_real = False
+        img = (p.get("original") or {}).get("source") or (p.get("thumbnail") or {}).get("source")
+        if not img:
             continue
         if looks_like_person(desc):
             return title, img
@@ -482,7 +488,7 @@ async def search_route(
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "build": "r13-hardened"}
+    return {"ok": True, "build": "r14-topblock"}
 
 
 @app.get("/pixelate")
