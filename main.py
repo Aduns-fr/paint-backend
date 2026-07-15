@@ -15,7 +15,7 @@ from io import BytesIO
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageOps
 
 app = FastAPI()
 
@@ -94,19 +94,23 @@ async def find_game_image(q: str) -> str | None:
 def pixelate(img_bytes: bytes, size: int, colors: int) -> dict:
     img = Image.open(BytesIO(img_bytes)).convert("RGB")
 
-    # grade it a little before quantizing: pop the colors, lift contrast, sharpen edges.
-    # limited palettes come out flat and muddy without this.
-    img = ImageEnhance.Color(img).enhance(1.25)
-    img = ImageEnhance.Contrast(img).enhance(1.08)
-
     # center-crop to a square so the picture FILLS the whole canvas face (paint boards are square)
     w, h = img.size
     side = min(w, h)
     img = img.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
-    img = img.resize((size, size), Image.LANCZOS)
-    img = ImageEnhance.Sharpness(img).enhance(1.3)
 
-    img = img.quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
+    # grade it before quantizing so a limited palette reads as a clear, punchy picture instead
+    # of muddy grey. autocontrast stretches washed-out wildlife photos across the full range,
+    # then we pop saturation and lift contrast a touch. this is the single biggest quality win.
+    img = ImageOps.autocontrast(img, cutoff=1)
+    img = ImageEnhance.Color(img).enhance(1.45)
+    img = ImageEnhance.Contrast(img).enhance(1.12)
+    img = ImageEnhance.Brightness(img).enhance(1.03)
+
+    img = img.resize((size, size), Image.LANCZOS)
+    img = ImageEnhance.Sharpness(img).enhance(1.4)
+
+    img = img.quantize(colors=colors, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
 
     raw_palette = img.getpalette()
     pixels = list(img.getdata())
@@ -147,6 +151,21 @@ def host_allowed(url: str) -> bool:
         return False
 
 
+# commons is full of junk that isn't a clean photo of the animal: maps, range charts, logos,
+# coats of arms, museum specimens, skeletons, diagrams, stamps. reject those by filename.
+_COMMONS_JUNK = (
+    "map", "range", "distribution", "locator", "logo", "coat_of_arms", "coat of arms",
+    "diagram", "chart", "seal", "flag", "stamp", "icon", "skeleton", "skull", "bone",
+    "specimen", "fossil", "illustration", "drawing", "sketch", "painting", "engraving",
+    "sign", "label", "graph", "phylogen", "cladogram", "anatomy", "svg",
+)
+
+
+def commons_ok(url: str) -> bool:
+    low = url.lower()
+    return not any(bad in low for bad in _COMMONS_JUNK)
+
+
 async def gather_candidates(q: str, catalog: str, n: int) -> list[dict]:
     """collect up to n {title, url} image candidates for a query"""
     out, seen = [], set()
@@ -171,25 +190,44 @@ async def gather_candidates(q: str, catalog: str, n: int) -> list[dict]:
         else:
             title = q
             taxon_id = None
-            # resolve the taxon so we get its proper common name + can pull its photos
+            # resolve the taxon so we get its proper common name + can pull its photos.
+            # taxa/autocomplete ranks by relevance so "fox" lands on the actual fox, and each
+            # taxon carries a curated default photo — the cleanest, most iconic shot we have.
             try:
                 r = await client.get(
-                    "https://api.inaturalist.org/v1/taxa",
-                    params={"q": q, "per_page": 1},
+                    "https://api.inaturalist.org/v1/taxa/autocomplete",
+                    params={"q": q, "per_page": 4},
                 )
                 res = r.json().get("results", [])
                 if res:
                     taxon_id = res[0].get("id")
                     title = res[0].get("preferred_common_name") or res[0].get("name") or q
-                    photo = res[0].get("default_photo") or {}
-                    add(title, photo.get("medium_url"))
+                    # pull the curated default photo from every close taxon match first
+                    for t in res:
+                        photo = t.get("default_photo") or {}
+                        add(t.get("preferred_common_name") or t.get("name") or title,
+                            (photo.get("medium_url") or "").replace("/square.", "/medium."))
             except Exception:
                 pass
-            # the deep well: top-voted research-grade observation photos (dozens per species)
+            # wikipedia summary: reliable, iconic hero shot for the common name
+            try:
+                r = await client.get(
+                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{q}",
+                    params={"redirect": "true"},
+                )
+                if r.status_code == 200:
+                    j = r.json()
+                    add(j.get("title", q), j.get("thumbnail", {}).get("source"))
+            except Exception:
+                pass
+            # the deep well: top-voted research-grade observation photos. this is where the
+            # VARIETY comes from — dozens of real, verified photos of the species from every
+            # angle. grab up to 2 photos per observation and page deep so scrolling never runs dry.
             try:
                 params = {
-                    "photos": "true", "per_page": min(max(n, 12), 50),
-                    "order_by": "votes", "order": "desc", "quality_grade": "research",
+                    "photos": "true", "per_page": 50,
+                    "order_by": "votes", "order": "desc",
+                    "quality_grade": "research",
                 }
                 if taxon_id:
                     params["taxon_id"] = taxon_id
@@ -197,13 +235,14 @@ async def gather_candidates(q: str, catalog: str, n: int) -> list[dict]:
                     params["taxon_name"] = q
                 r = await client.get("https://api.inaturalist.org/v1/observations", params=params)
                 for obs in r.json().get("results", []):
-                    for p in obs.get("photos", []):
+                    for p in (obs.get("photos") or [])[:2]:
                         u = p.get("url")
                         if u:
                             add(title, u.replace("/square.", "/medium."))
             except Exception:
                 pass
-            # wikimedia commons image search (broadens variety, breeds, angles)
+            # wikimedia commons last, and only clean photos — filtered hard against junk
+            # (maps, diagrams, specimens). it's the noisiest source so it fills, never leads.
             try:
                 r = await client.get(
                     "https://commons.wikimedia.org/w/api.php",
@@ -217,19 +256,8 @@ async def gather_candidates(q: str, catalog: str, n: int) -> list[dict]:
                 for page in pages.values():
                     ii = (page.get("imageinfo") or [{}])[0]
                     url = ii.get("thumburl") or ""
-                    if url.lower().endswith((".jpg", ".jpeg", ".png")):
+                    if url.lower().endswith((".jpg", ".jpeg", ".png")) and commons_ok(url):
                         add(title, url)
-            except Exception:
-                pass
-            # wikipedia summary as a reliable fallback for the first tile
-            try:
-                r = await client.get(
-                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{q}",
-                    params={"redirect": "true"},
-                )
-                if r.status_code == 200:
-                    j = r.json()
-                    add(j.get("title", q), j.get("thumbnail", {}).get("source"))
             except Exception:
                 pass
     return out[:n]
