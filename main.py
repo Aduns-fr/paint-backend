@@ -159,7 +159,14 @@ _BLOCKED_WORDS = (
     "adult model", "onlyfans", "erotic", "stripper", "sex worker", "escort", "camgirl",
     "cam girl", "hentai", "xxx", "nude", "playmate", "penthouse",
     "serial killer", "murderer", "terrorist", "war criminal", "sex offender", "rapist",
-    "cult leader", "drug lord", "mobster", "gangster",
+    "cult leader", "drug lord", "mobster", "gangster", "mass murder", "school shooter",
+    "assassin", "kidnapper", "human traffick",
+    # dictators, nazis and genocide. these are humans on wikidata so the human check alone
+    # passes them, they have to be named here or caught by their description
+    "hitler", "adolf", "nazi", "nazism", "third reich", "fuhrer", "führer", "gestapo",
+    "goebbels", "himmler", "eichmann", "mengele", "holocaust", "genocide", "dictator",
+    "fascist", "stalin", "mussolini", "pol pot", "crimes against humanity", "ethnic cleansing",
+    "bin laden", "osama", "al-qaeda", "al qaeda", "taliban", "jihadist", "isis leader",
 )
 
 
@@ -511,7 +518,7 @@ async def search_route(
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "build": "r15-wikidata"}
+    return {"ok": True, "build": "r16-blockdictators"}
 
 
 @app.get("/pixelate")
