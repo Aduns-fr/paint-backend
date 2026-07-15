@@ -9,6 +9,7 @@ catalogs:
   games   -> RAWG (needs RAWG_KEY env var, free tier is fine)
 """
 
+import asyncio
 import os
 import re
 import time
@@ -150,6 +151,23 @@ def _ascii(s: str) -> str:
     ).lower()
 
 
+# brand/ToS safety for a kids' Roblox game: never resolve people whose wikipedia description
+# marks them as adult-industry or violent-crime figures. checked against BOTH the query and the
+# resolved page's description, so neither a direct search nor a sneaky alias gets through.
+_BLOCKED_WORDS = (
+    "pornograph", "porn", "adult film", "adult actress", "adult actor", "adult entertainer",
+    "adult model", "onlyfans", "erotic", "stripper", "sex worker", "escort", "camgirl",
+    "cam girl", "hentai", "xxx", "nude", "playmate", "penthouse",
+    "serial killer", "murderer", "terrorist", "war criminal", "sex offender", "rapist",
+    "cult leader", "drug lord", "mobster", "gangster",
+)
+
+
+def blocked_text(s: str) -> bool:
+    low = _ascii(s)
+    return any(b in low for b in _BLOCKED_WORDS)
+
+
 def looks_like_person(description: str) -> bool:
     d = (description or "").lower()
     if not d:
@@ -163,7 +181,9 @@ async def resolve_person(client, q: str):
     """turn a typed name into the RIGHT wikipedia person + their infobox portrait.
     full-text search means 'messi', 'ronaldo', lowercase and small typos all land on the real
     person (the summary/{title} endpoint we used before only worked for exact page titles).
-    returns (title, image_url) or (None, None) when nothing looks like a person."""
+    returns (title, image_url) or (None, None) when nothing looks like a (safe) person."""
+    if blocked_text(q):
+        return None, None
     try:
         r = await client.get("https://en.wikipedia.org/w/api.php", params={
             "action": "query", "generator": "search", "gsrsearch": q, "gsrlimit": 6,
@@ -183,6 +203,8 @@ async def resolve_person(client, q: str):
         if not img:
             continue
         desc = p.get("description", "")
+        if blocked_text(title) or blocked_text(desc):
+            continue
         if looks_like_person(desc):
             return title, img
         if fallback is None and not desc:
@@ -420,7 +442,7 @@ async def gather_candidates(q: str, catalog: str, n: int) -> list[dict]:
 
 @app.get("/search")
 async def search_route(
-    q: str = Query(..., max_length=80),
+    q: str = Query(..., min_length=3, max_length=80),
     catalog: str = Query("animals"),
     n: int = Query(6, ge=1, le=12),
     offset: int = Query(0, ge=0, le=60),
@@ -435,19 +457,24 @@ async def search_route(
         return cached
     focus = "top" if is_people(catalog) else "center"
     candidates = (await gather_candidates(q, catalog, offset + n))[offset:]
-    results = []
+    # fetch + pixelate the previews CONCURRENTLY (was sequential — 6 round-trips in a row was
+    # the slow part of every search). semaphore bounds concurrent decodes so memory stays flat.
+    sem = asyncio.Semaphore(4)
     async with httpx.AsyncClient(timeout=12, headers=UA, follow_redirects=True) as client:
-        for c in candidates:
-            try:
-                r = await client.get(c["url"])
-                if r.status_code != 200:
-                    continue
-                d = pixelate(r.content, size, colors, focus)
-                d["title"] = c["title"]
-                d["url"] = c["url"]
-                results.append(d)
-            except Exception:
-                continue
+        async def preview(c):
+            async with sem:
+                try:
+                    r = await client.get(c["url"])
+                    if r.status_code != 200:
+                        return None
+                    d = pixelate(r.content, size, colors, focus)
+                    d["title"] = c["title"]
+                    d["url"] = c["url"]
+                    return d
+                except Exception:
+                    return None
+
+        results = [d for d in await asyncio.gather(*(preview(c) for c in candidates)) if d]
     if results:
         cache_put(ckey, results)
     return results
@@ -455,7 +482,7 @@ async def search_route(
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "build": "r12-cleanphotos"}
+    return {"ok": True, "build": "r13-hardened"}
 
 
 @app.get("/pixelate")
