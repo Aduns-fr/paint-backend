@@ -299,7 +299,7 @@ async def search_route(
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "build": "r7-imgquality"}
 
 
 @app.get("/pixelate")
