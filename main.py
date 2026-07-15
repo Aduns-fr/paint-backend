@@ -10,6 +10,7 @@ catalogs:
 """
 
 import os
+import time
 from io import BytesIO
 
 import httpx
@@ -17,6 +18,26 @@ from fastapi import FastAPI, HTTPException, Query
 from PIL import Image, ImageEnhance
 
 app = FastAPI()
+
+# in-memory TTL cache so repeated searches don't re-fetch or re-pixelate. this is what lets a
+# cheap Render plan handle real traffic — most searches are for the same popular animals.
+_CACHE = {}
+_CACHE_TTL = 6 * 3600
+_CACHE_MAX = 800
+
+
+def cache_get(key):
+    hit = _CACHE.get(key)
+    if hit and time.time() - hit[0] < _CACHE_TTL:
+        return hit[1]
+    return None
+
+
+def cache_put(key, value):
+    if len(_CACHE) >= _CACHE_MAX:
+        oldest = min(_CACHE, key=lambda k: _CACHE[k][0])
+        del _CACHE[oldest]
+    _CACHE[key] = (time.time(), value)
 
 # wikipedia blocks generic UAs, they want a descriptive one
 UA = {"User-Agent": "paint-game-backend/1.0 (roblox paint game; contact: erioluwaaduleye@gmail.com)"}
@@ -225,6 +246,10 @@ async def search_route(
 ):
     """returns candidate images WITH small pixelated previews, all in one call.
     offset pages through candidates so the game can infinite-scroll results."""
+    ckey = f"s:{catalog}:{q.lower()}:{offset}:{n}:{size}:{colors}"
+    cached = cache_get(ckey)
+    if cached is not None:
+        return cached
     candidates = (await gather_candidates(q, catalog, offset + n))[offset:]
     results = []
     async with httpx.AsyncClient(timeout=12, headers=UA, follow_redirects=True) as client:
@@ -239,6 +264,8 @@ async def search_route(
                 results.append(d)
             except Exception:
                 continue
+    if results:
+        cache_put(ckey, results)
     return results
 
 
@@ -267,6 +294,11 @@ async def pixelate_route(
     if not url:
         raise HTTPException(404, "no image found for that search")
 
+    ckey = f"p:{url}:{size}:{colors}"
+    cached = cache_get(ckey)
+    if cached is not None:
+        return cached
+
     async with httpx.AsyncClient(timeout=15, headers=UA, follow_redirects=True) as client:
         r = await client.get(url)
         if r.status_code != 200:
@@ -274,6 +306,8 @@ async def pixelate_route(
         img_bytes = r.content
 
     try:
-        return pixelate(img_bytes, size, colors)
+        result = pixelate(img_bytes, size, colors)
+        cache_put(ckey, result)
+        return result
     except Exception:
         raise HTTPException(500, "couldn't process that image")
