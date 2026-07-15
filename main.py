@@ -180,42 +180,65 @@ def looks_like_person(description: str) -> bool:
 async def resolve_person(client, q: str):
     """turn a typed name into the RIGHT wikipedia person + their infobox portrait.
     full-text search means 'messi', 'ronaldo', lowercase and small typos all land on the real
-    person (the summary/{title} endpoint we used before only worked for exact page titles).
-    returns (title, image_url) or (None, None) when nothing looks like a (safe) person."""
+    person. person-ness is verified via WIKIDATA (instance-of = human), not an occupation word
+    list — word lists miss presidents/businessmen/royals and then slide to the wrong person
+    (searching 'donald trump' used to return donald GLOVER because 'president' wasn't a word
+    we knew). returns (title, image_url) or (None, None) when nothing is a (safe) person."""
     if blocked_text(q):
         return None, None
     try:
         r = await client.get("https://en.wikipedia.org/w/api.php", params={
             "action": "query", "generator": "search", "gsrsearch": q, "gsrlimit": 6,
-            "prop": "pageimages|description", "piprop": "original|thumbnail",
-            "pithumbsize": 800, "pilimit": 6, "format": "json", "redirects": 1,
+            "prop": "pageimages|description|pageprops", "ppprop": "wikibase_item",
+            "piprop": "original|thumbnail", "pithumbsize": 800, "pilimit": 6,
+            "format": "json", "redirects": 1,
         })
         pages = list(r.json().get("query", {}).get("pages", {}).values())
     except Exception:
         return None, None
     pages.sort(key=lambda p: p.get("index", 999))  # search relevance order
-    fallback = None  # top image-bearing page with an EMPTY description (obscure but real person)
-    first_real = True
-    for p in pages:
-        title = p.get("title", "")
-        if title.lower().startswith(("list of", "category:")):
-            continue
+    cands = [p for p in pages
+             if not p.get("title", "").lower().startswith(("list of", "category:"))]
+
+    # one batched wikidata call: which candidates are actually HUMANS (P31 = Q5)?
+    humans = {}
+    ids = "|".join(qid for qid in (
+        p.get("pageprops", {}).get("wikibase_item") for p in cands) if qid)
+    if ids:
+        try:
+            r = await client.get("https://www.wikidata.org/w/api.php", params={
+                "action": "wbgetentities", "ids": ids, "props": "claims", "format": "json",
+            })
+            for qid, ent in r.json().get("entities", {}).items():
+                for claim in (ent.get("claims", {}).get("P31") or []):
+                    v = claim.get("mainsnak", {}).get("datavalue", {}).get("value", {})
+                    if isinstance(v, dict) and v.get("id") == "Q5":
+                        humans[qid] = True
+                        break
+        except Exception:
+            pass
+
+    first_person = True
+    for p in cands:
+        qid = p.get("pageprops", {}).get("wikibase_item")
         desc = p.get("description", "")
+        title = p.get("title", "")
+        # wikidata is the authority; the old occupation wordlist stays as a net for the rare
+        # page with no wikidata link
+        if not (humans.get(qid) or looks_like_person(desc)):
+            continue
         if blocked_text(title) or blocked_text(desc):
-            # if the TOP match for this query is a blocked person, the player was searching for
-            # THEM — return nothing rather than sliding to a relative or a spin-off page.
-            if first_real:
+            # if the TOP person match for this query is blocked, the player was searching for
+            # THEM — return nothing rather than sliding to a relative or lookalike.
+            if first_person:
                 return None, None
             continue
-        first_real = False
+        first_person = False
         img = (p.get("original") or {}).get("source") or (p.get("thumbnail") or {}).get("source")
-        if not img:
-            continue
-        if looks_like_person(desc):
+        if img:
             return title, img
-        if fallback is None and not desc:
-            fallback = (title, img)
-    return fallback if fallback else (None, None)
+        # a human with no photo on the page: keep looking at the next candidate
+    return None, None
 
 
 async def find_person_image(q: str) -> str | None:
@@ -488,7 +511,7 @@ async def search_route(
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "build": "r14-topblock"}
+    return {"ok": True, "build": "r15-wikidata"}
 
 
 @app.get("/pixelate")
