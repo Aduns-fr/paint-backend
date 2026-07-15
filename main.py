@@ -11,6 +11,7 @@ catalogs:
 
 import os
 import time
+import unicodedata
 from io import BytesIO
 
 import httpx
@@ -131,6 +132,13 @@ _PERSON_WORDS = (
     "author", "writer", "director", "gymnast", "skater", "quarterback", "coach",
     "manager", "politician", "born ", "singer and", "actor and", "rapper and",
 )
+
+
+def _ascii(s: str) -> str:
+    """lower-case + strip accents so 'Beyoncé' matches a 'Beyonce_2018.jpg' filename."""
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(c)
+    ).lower()
 
 
 def looks_like_person(description: str) -> bool:
@@ -319,6 +327,31 @@ async def gather_candidates(q: str, catalog: str, n: int) -> list[dict]:
                         add(title, url)
             except Exception:
                 pass
+            # step 3 (top-up): if their category was thin, add wikipedia article images — but
+            # ONLY files whose name contains part of their name (accent-insensitive), so every
+            # extra shot is still definitely them, never a co-star or venue.
+            if len(out) < n and title:
+                tokens = [_ascii(t) for t in title.replace("-", " ").split() if len(t) > 2]
+                try:
+                    r = await client.get(
+                        f"https://en.wikipedia.org/api/rest_v1/page/media-list/{title}",
+                        params={"redirect": "true"},
+                    )
+                    if r.status_code == 200:
+                        for item in r.json().get("items", []):
+                            if item.get("type") != "image":
+                                continue
+                            srcset = item.get("srcset") or []
+                            src = srcset[0].get("src") if srcset else None
+                            if not src:
+                                continue
+                            if src.startswith("//"):
+                                src = "https:" + src
+                            low = _ascii(src)
+                            if any(tok in low for tok in tokens) and person_photo_ok(src):
+                                add(title, src)
+                except Exception:
+                    pass
         else:
             title = q
             taxon_id = None
@@ -432,7 +465,7 @@ async def search_route(
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "build": "r10-peoplesearch"}
+    return {"ok": True, "build": "r11-variety"}
 
 
 @app.get("/pixelate")
