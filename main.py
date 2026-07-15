@@ -91,13 +91,64 @@ async def find_game_image(q: str) -> str | None:
     return None
 
 
-def pixelate(img_bytes: bytes, size: int, colors: int) -> dict:
+# catalogs that are real people (Paint a Celebrity / Paint a Footballer share one pipeline).
+PEOPLE_CATALOGS = {"celebrity", "celebrities", "footballer", "footballers", "people", "person"}
+
+
+def is_people(catalog: str) -> bool:
+    return (catalog or "").lower() in PEOPLE_CATALOGS
+
+
+# for people we only want a clean PHOTO of the face — not a signature, wax figure, statue,
+# magazine cover, jersey, award, cartoon or anything with text. these wreck a portrait.
+_PEOPLE_JUNK = (
+    "logo", "signature", "autograph", "wax", "tussaud", "statue", "mural", "graffiti",
+    "caricature", "cartoon", "poster", "magazine", "cover", "book", "award", "trophy",
+    "jersey", "boot", "stamp", "banner", "plaque", "tattoo", "meme", "quote", "diagram",
+    "map", "chart", "logo", "svg", "icon", "text", "collage", "montage", "timeline",
+    "career", "goals", "stats", "kit", "badge", "crest", "flag", "medal",
+)
+
+
+def person_photo_ok(url: str) -> bool:
+    low = url.lower()
+    if not low.endswith((".jpg", ".jpeg", ".png")):
+        return False
+    return not any(bad in low for bad in _PEOPLE_JUNK)
+
+
+async def find_person_image(q: str) -> str | None:
+    """best single portrait for a famous name: wikipedia's lead image (freely licensed)."""
+    async with httpx.AsyncClient(timeout=10, headers=UA, follow_redirects=True) as client:
+        try:
+            r = await client.get(
+                f"https://en.wikipedia.org/api/rest_v1/page/summary/{q}",
+                params={"redirect": "true"},
+            )
+            if r.status_code == 200:
+                j = r.json()
+                # prefer the full-res original, fall back to the thumbnail
+                return (j.get("originalimage", {}).get("source")
+                        or j.get("thumbnail", {}).get("source"))
+        except Exception:
+            pass
+    return None
+
+
+def pixelate(img_bytes: bytes, size: int, colors: int, focus: str = "center") -> dict:
     img = Image.open(BytesIO(img_bytes)).convert("RGB")
 
-    # center-crop to a square so the picture FILLS the whole canvas face (paint boards are square)
+    # crop to a square so the picture FILLS the whole canvas face (paint boards are square).
+    # for faces we bias the crop toward the TOP — portraits put the head high, and a centered
+    # crop of a full-body shot would slice the face off. "top" keeps the head in frame.
     w, h = img.size
     side = min(w, h)
-    img = img.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
+    x0 = (w - side) // 2
+    if focus == "top":
+        y0 = int((h - side) * 0.12)
+    else:
+        y0 = (h - side) // 2
+    img = img.crop((x0, y0, x0 + side, y0 + side))
 
     # grade it before quantizing so a limited palette reads as a clear, punchy picture instead
     # of muddy grey. autocontrast stretches washed-out wildlife photos across the full range,
@@ -187,6 +238,61 @@ async def gather_candidates(q: str, catalog: str, n: int) -> list[dict]:
                         add(g.get("name", q), g.get("background_image"))
                 except Exception:
                     pass
+        elif is_people(catalog):
+            # PEOPLE pipeline (celebrities + footballers): freely-licensed portraits only.
+            title = q
+            # wikipedia lead portrait first — clean, iconic, always the best single shot
+            try:
+                r = await client.get(
+                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{q}",
+                    params={"redirect": "true"},
+                )
+                if r.status_code == 200:
+                    j = r.json()
+                    title = j.get("title", q)
+                    add(title, j.get("originalimage", {}).get("source"))
+                    add(title, j.get("thumbnail", {}).get("source"))
+            except Exception:
+                pass
+            # every free image embedded in their wikipedia article — lots of real event photos.
+            # this is the variety well for people (equivalent to the observations well for animals).
+            try:
+                r = await client.get(
+                    f"https://en.wikipedia.org/api/rest_v1/page/media-list/{q}",
+                    params={"redirect": "true"},
+                )
+                if r.status_code == 200:
+                    for item in r.json().get("items", []):
+                        if item.get("type") != "image":
+                            continue
+                        srcset = item.get("srcset") or []
+                        src = srcset[0].get("src") if srcset else None
+                        if not src:
+                            continue
+                        if src.startswith("//"):
+                            src = "https:" + src
+                        if person_photo_ok(src):
+                            add(title, src)
+            except Exception:
+                pass
+            # wikimedia commons search for extra angles, filtered hard against non-photo junk
+            try:
+                r = await client.get(
+                    "https://commons.wikimedia.org/w/api.php",
+                    params={
+                        "action": "query", "generator": "search",
+                        "gsrsearch": q, "gsrnamespace": 6, "gsrlimit": 30,
+                        "prop": "imageinfo", "iiprop": "url", "iiurlwidth": 600, "format": "json",
+                    },
+                )
+                pages = r.json().get("query", {}).get("pages", {})
+                for page in pages.values():
+                    ii = (page.get("imageinfo") or [{}])[0]
+                    url = ii.get("thumburl") or ""
+                    if person_photo_ok(url):
+                        add(title, url)
+            except Exception:
+                pass
         else:
             title = q
             taxon_id = None
@@ -278,6 +384,7 @@ async def search_route(
     cached = cache_get(ckey)
     if cached is not None:
         return cached
+    focus = "top" if is_people(catalog) else "center"
     candidates = (await gather_candidates(q, catalog, offset + n))[offset:]
     results = []
     async with httpx.AsyncClient(timeout=12, headers=UA, follow_redirects=True) as client:
@@ -286,7 +393,7 @@ async def search_route(
                 r = await client.get(c["url"])
                 if r.status_code != 200:
                     continue
-                d = pixelate(r.content, size, colors)
+                d = pixelate(r.content, size, colors, focus)
                 d["title"] = c["title"]
                 d["url"] = c["url"]
                 results.append(d)
@@ -299,7 +406,7 @@ async def search_route(
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "build": "r7-imgquality"}
+    return {"ok": True, "build": "r8-celebrity"}
 
 
 @app.get("/pixelate")
@@ -317,12 +424,15 @@ async def pixelate_route(
     elif q:
         if catalog == "games":
             url = await find_game_image(q)
+        elif is_people(catalog):
+            url = await find_person_image(q)
         else:
             url = await find_animal_image(q)
     if not url:
         raise HTTPException(404, "no image found for that search")
 
-    ckey = f"p:{url}:{size}:{colors}"
+    focus = "top" if is_people(catalog) else "center"
+    ckey = f"p:{url}:{size}:{colors}:{focus}"
     cached = cache_get(ckey)
     if cached is not None:
         return cached
@@ -334,7 +444,7 @@ async def pixelate_route(
         img_bytes = r.content
 
     try:
-        result = pixelate(img_bytes, size, colors)
+        result = pixelate(img_bytes, size, colors, focus)
         cache_put(ckey, result)
         return result
     except Exception:
