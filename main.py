@@ -23,7 +23,9 @@ app = FastAPI()
 # cheap Render plan handle real traffic — most searches are for the same popular animals.
 _CACHE = {}
 _CACHE_TTL = 6 * 3600
-_CACHE_MAX = 800
+# each /pixelate entry holds a full 160x160 grid (~0.7 MB as nested lists), so this cap is a
+# hard memory budget, not just a hit-rate knob. 120 keeps us comfortably under a 512 MB instance.
+_CACHE_MAX = 120
 
 
 def cache_get(key):
@@ -136,7 +138,17 @@ async def find_person_image(q: str) -> str | None:
 
 
 def pixelate(img_bytes: bytes, size: int, colors: int, focus: str = "center") -> dict:
-    img = Image.open(BytesIO(img_bytes)).convert("RGB")
+    img = Image.open(BytesIO(img_bytes))
+    # MEMORY GUARD: a full-res wikipedia original can decode to 100+ MB and OOM a 512 MB box.
+    # draft() decodes JPEGs at a reduced scale cheaply; thumbnail() then hard-caps the bitmap.
+    # we're about to shrink to `size` (<=192) anyway, so 1024px loses nothing visible.
+    try:
+        img.draft("RGB", (1024, 1024))
+    except Exception:
+        pass
+    img = img.convert("RGB")
+    if max(img.size) > 1024:
+        img.thumbnail((1024, 1024), Image.LANCZOS)
 
     # crop to a square so the picture FILLS the whole canvas face (paint boards are square).
     # for faces we bias the crop toward the TOP — portraits put the head high, and a centered
@@ -406,7 +418,7 @@ async def search_route(
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "build": "r8-celebrity"}
+    return {"ok": True, "build": "r9-leanmem"}
 
 
 @app.get("/pixelate")
