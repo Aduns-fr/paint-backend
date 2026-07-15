@@ -10,6 +10,7 @@ catalogs:
 """
 
 import os
+import re
 import time
 import unicodedata
 from io import BytesIO
@@ -102,22 +103,30 @@ def is_people(catalog: str) -> bool:
     return (catalog or "").lower() in PEOPLE_CATALOGS
 
 
-# for people we only want a clean PHOTO of the person — not a signature, wax figure, statue,
-# logo, poster or anything with text/graphics. these wreck a portrait. (kept tight so we don't
-# reject legit event photos like "...at the 2019 awards.jpg".)
-_PEOPLE_JUNK = (
-    "logo", "signature", "autograph", "wax", "tussaud", "statue", "mural", "graffiti",
-    "caricature", "cartoon", "poster", "magazine", "trophy", "stamp", "banner",
-    "plaque", "tattoo", "meme", "diagram", "map", "chart", "svg", "icon",
-    "collage", "montage", "timeline", "badge", "crest", "flag", "medal", "coin",
-)
+# a famous person's commons files / article images include tons of stuff that ISN'T a photo of
+# them: their car, boots, jersey, statue, signature, graffiti, childhood home, a license plate,
+# fan crowds, artwork. we reject any file whose name contains one of these WHOLE words. (whole-word
+# match via tokenising, so "art" doesn't nuke "Bart" and "car" doesn't nuke "Oscar".)
+_PEOPLE_REJECT = {
+    "logo", "signature", "firma", "autograph", "wax", "waxwork", "tussaud", "statue",
+    "sculpture", "bust", "mural", "graffiti", "caricature", "cartoon", "art", "sketch",
+    "drawing", "painting", "poster", "magazine", "cover", "trophy", "stamp", "banner",
+    "plaque", "tattoo", "meme", "diagram", "map", "chart", "svg", "icon", "collage",
+    "montage", "timeline", "badge", "crest", "flag", "medal", "coin", "boot", "boots",
+    "cleat", "cleats", "shoe", "shoes", "jersey", "shirt", "kit", "sign", "signage",
+    "billboard", "stadium", "stade", "arena", "mosaic", "replica", "museum", "exhibit",
+    "figurine", "toy", "doll", "grave", "gravestone", "memorial", "monument", "building",
+    "car", "plate", "license", "vanity", "fan", "fans", "hinchas", "street", "casa",
+    "predio", "paseo", "house", "academy", "masia",
+}
 
 
 def person_photo_ok(url: str) -> bool:
     low = url.lower()
     if not low.endswith((".jpg", ".jpeg", ".png")):
         return False
-    return not any(bad in low for bad in _PEOPLE_JUNK)
+    toks = set(re.split(r"[^a-z0-9]+", _ascii(url)))
+    return not (toks & _PEOPLE_REJECT)
 
 
 # a wikipedia short-description almost always states the occupation for a real person
@@ -308,50 +317,31 @@ async def gather_candidates(q: str, catalog: str, n: int) -> list[dict]:
             if not lead:
                 return []  # nothing matched a real person — return nothing, never random pics
             add(title, lead)
-            # step 2: variety comes ONLY from that person's own commons category, so every extra
-            # shot is genuinely them (free-text image search was what pulled in random junk before).
+            # variety: pull from their WIKIPEDIA ARTICLE images — editors curate real photos of the
+            # person there. keep a file only when its name (a) names the person AND (b) isn't an
+            # object/artwork. we do NOT use their raw commons category: for a famous person it's
+            # mostly memorabilia (their car, boots, statue, signature, childhood home), not them.
+            tokens = [_ascii(t) for t in title.replace("-", " ").split() if len(t) >= 4]
             try:
                 r = await client.get(
-                    "https://commons.wikimedia.org/w/api.php",
-                    params={
-                        "action": "query", "generator": "categorymembers",
-                        "gcmtitle": f"Category:{title}", "gcmtype": "file", "gcmlimit": 40,
-                        "prop": "imageinfo", "iiprop": "url", "iiurlwidth": 600, "format": "json",
-                    },
+                    f"https://en.wikipedia.org/api/rest_v1/page/media-list/{title}",
+                    params={"redirect": "true"},
                 )
-                pages = r.json().get("query", {}).get("pages", {})
-                for page in sorted(pages.values(), key=lambda p: p.get("title", "")):
-                    ii = (page.get("imageinfo") or [{}])[0]
-                    url = ii.get("thumburl") or ""
-                    if person_photo_ok(url):
-                        add(title, url)
+                if r.status_code == 200:
+                    for item in r.json().get("items", []):
+                        if item.get("type") != "image":
+                            continue
+                        srcset = item.get("srcset") or []
+                        src = (srcset[-1] if srcset else {}).get("src")  # biggest available thumb
+                        if not src:
+                            continue
+                        if src.startswith("//"):
+                            src = "https:" + src
+                        low = _ascii(src)
+                        if tokens and any(tok in low for tok in tokens) and person_photo_ok(src):
+                            add(title, src)
             except Exception:
                 pass
-            # step 3 (top-up): if their category was thin, add wikipedia article images — but
-            # ONLY files whose name contains part of their name (accent-insensitive), so every
-            # extra shot is still definitely them, never a co-star or venue.
-            if len(out) < n and title:
-                tokens = [_ascii(t) for t in title.replace("-", " ").split() if len(t) > 2]
-                try:
-                    r = await client.get(
-                        f"https://en.wikipedia.org/api/rest_v1/page/media-list/{title}",
-                        params={"redirect": "true"},
-                    )
-                    if r.status_code == 200:
-                        for item in r.json().get("items", []):
-                            if item.get("type") != "image":
-                                continue
-                            srcset = item.get("srcset") or []
-                            src = srcset[0].get("src") if srcset else None
-                            if not src:
-                                continue
-                            if src.startswith("//"):
-                                src = "https:" + src
-                            low = _ascii(src)
-                            if any(tok in low for tok in tokens) and person_photo_ok(src):
-                                add(title, src)
-                except Exception:
-                    pass
         else:
             title = q
             taxon_id = None
@@ -465,7 +455,7 @@ async def search_route(
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "build": "r11-variety"}
+    return {"ok": True, "build": "r12-cleanphotos"}
 
 
 @app.get("/pixelate")
